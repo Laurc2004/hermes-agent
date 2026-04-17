@@ -40,9 +40,27 @@ logger = logging.getLogger(__name__)
 # (HERMES_HOME env var changes) are always respected.  The old module-level
 # constant was cached at import time and could go stale if a profile switch
 # happened after the first import.
-def get_memory_dir() -> Path:
-    """Return the profile-scoped memories directory."""
-    return get_hermes_home() / "memories"
+#
+# When user_id is provided (gateway mode), memory is scoped per-user:
+#   HERMES_HOME/memories/{user_id}/MEMORY.md
+#   HERMES_HOME/memories/{user_id}/USER.md
+#
+# When user_id is None (CLI mode), uses a shared directory:
+#   HERMES_HOME/memories/MEMORY.md
+#   HERMES_HOME/memories/USER.md
+
+_DEFAULT_USER_DIR = "_default"
+
+
+def get_memory_dir(user_id: str = None) -> Path:
+    """Return the profile-scoped memories directory, optionally per-user."""
+    base = get_hermes_home() / "memories"
+    if user_id:
+        # Sanitize user_id to prevent path traversal
+        safe = re.sub(r'[^\w@.\-]', '_', str(user_id))
+        return base / safe
+    return base
+
 
 # Backward-compatible alias — gateway/run.py imports this at runtime inside
 # a function body, so it gets the correct snapshot for that process.  New code
@@ -108,17 +126,18 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, user_id: str = None):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self._user_id = user_id
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
-        mem_dir = get_memory_dir()
+        mem_dir = get_memory_dir(self._user_id)
         mem_dir.mkdir(parents=True, exist_ok=True)
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
@@ -153,8 +172,8 @@ class MemoryStore:
             fd.close()
 
     @staticmethod
-    def _path_for(target: str) -> Path:
-        mem_dir = get_memory_dir()
+    def _path_for(target: str, user_id: str = None) -> Path:
+        mem_dir = get_memory_dir(user_id)
         if target == "user":
             return mem_dir / "USER.md"
         return mem_dir / "MEMORY.md"
@@ -164,14 +183,14 @@ class MemoryStore:
 
         Called under file lock to get the latest state before mutating.
         """
-        fresh = self._read_file(self._path_for(target))
+        fresh = self._read_file(self._path_for(target, self._user_id))
         fresh = list(dict.fromkeys(fresh))  # deduplicate
         self._set_entries(target, fresh)
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
-        get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        get_memory_dir(self._user_id).mkdir(parents=True, exist_ok=True)
+        self._write_file(self._path_for(target, self._user_id), self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -206,7 +225,7 @@ class MemoryStore:
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        with self._file_lock(self._path_for(target)):
+        with self._file_lock(self._path_for(target, self._user_id)):
             # Re-read from disk under lock to pick up writes from other sessions
             self._reload_target(target)
 
@@ -254,7 +273,7 @@ class MemoryStore:
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        with self._file_lock(self._path_for(target)):
+        with self._file_lock(self._path_for(target, self._user_id)):
             self._reload_target(target)
 
             entries = self._entries_for(target)
@@ -304,7 +323,7 @@ class MemoryStore:
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
 
-        with self._file_lock(self._path_for(target)):
+        with self._file_lock(self._path_for(target, self._user_id)):
             self._reload_target(target)
 
             entries = self._entries_for(target)
